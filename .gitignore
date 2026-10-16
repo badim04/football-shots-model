@@ -1,0 +1,26 @@
+# Raw FotMob JSON cache — large, regenerable, must not be committed
+data/raw_cache/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+
+# --- added by github_auto_sync ---
+.env
+.env.*
+config.txt
+*.pem
+*.key
+.api_cache/
+node_modules/
+*_profile/
+*.rar
+*.zip
