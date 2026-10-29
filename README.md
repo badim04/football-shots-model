@@ -1,5 +1,7 @@
 # Football Shots & Shots-on-Target Model
 
+> **Case study:** a plain-English walkthrough of how this works, step by step, with the key code: https://abdulakeem-adebayo.vercel.app/#football
+
 Predicts, per player, expected **shots** and **shots on target** for their
 next match, plus the probability of hitting configurable thresholds
 (≥1, ≥2, ≥3 shots; ≥1, ≥2 SOT). Covers the Premier League, La Liga,
