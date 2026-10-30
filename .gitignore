@@ -1,6 +1,18 @@
 # Raw FotMob JSON cache — large, regenerable, must not be committed
 data/raw_cache/
 
+# The database is local (~70 MB with full history) - the deployed app reads
+# data/published/ instead. Models are rebuilt by every retrain.
+data/matches.db
+data/matches.db-journal
+models/*.joblib
+
+# Daily job output
+logs/*.log
+
+# Secrets (Telegram bot token, chat id)
+.env
+
 # Python
 __pycache__/
 *.pyc

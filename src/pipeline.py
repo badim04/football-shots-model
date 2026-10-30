@@ -5,13 +5,15 @@ features.py stay "dumb" (no knowledge of the DB, no knowledge of what's
 already been fetched).
 """
 
+import json
+import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
 import config
-from src import db, scraper, features, train, drift
+from src import db, scraper, features, train, evaluate, telegram
 
 
 def _now() -> str:
@@ -132,76 +134,182 @@ def upcoming_fixtures(days_ahead: int = 7, refresh: bool = True) -> pd.DataFrame
     if refresh:
         sync_fixtures([config.CURRENT_SEASON], log=lambda *_: None)
     date_from, date_to = scraper.next_n_days_range(days_ahead)
-    return db.upcoming_matches(date_from, date_to)
+    upcoming = db.upcoming_matches(date_from, date_to)
+    # A match FotMob still lists as "scheduled" may already have kicked off
+    # (the fixture list is only refreshed when we ask) - never predict those.
+    now = datetime.now(timezone.utc)
+    return upcoming[pd.to_datetime(upcoming["kickoff_utc"], utc=True, format="ISO8601") > now].reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
 # Modelling
 # ---------------------------------------------------------------------------
 
-def weekly_retrain(recent_n_overall: int = None, recent_n_opponent: int = None) -> dict:
+def _history():
+    return db.load_player_match_stats(), db.load_team_match_stats()
+
+
+def weekly_retrain() -> dict:
     """
-    Full retrain on everything in the database: rebuild features for all
-    completed matches, time-based train/test split, fit both models, run
-    drift detection, persist model + metrics.
+    Rebuild features from every stored match, compare baseline / GLM /
+    XGBoost on the most recent weeks, refit the best on everything, save.
     """
     db.init_db()
-    recent_n_overall = recent_n_overall or config.RECENT_N_OVERALL
-    recent_n_opponent = recent_n_opponent or config.RECENT_N_OPPONENT
-
-    raw = db.load_player_match_stats()
-    if raw.empty:
+    players, teams = _history()
+    if players.empty:
         return {"status": "no_data"}
-
-    feat_df = features.build_feature_table(raw, recent_n_overall, recent_n_opponent)
-    metrics = train.train_and_save(feat_df)
-    # Drift compares within the current season only — early weeks of THIS
-    # season vs. its latest week (stage 3 replaces this with a calibration check).
-    drift_report = drift.run_drift_check(feat_df[feat_df.season == config.CURRENT_SEASON])
-
-    db.save_model_metrics(metrics)
-    db.save_drift_metrics(drift_report)
-
-    return {"status": "ok", "metrics": metrics, "drift": drift_report.to_dict("records")}
+    feat = features.build_features(players, teams)
+    rows = features.training_rows(feat)
+    report = train.train_and_save(rows)
+    trained_at = train.load_bundle()["trained_at"]
+    db.save_model_run(report, trained_at)
+    return {"status": "ok", "trained_at": trained_at, "report": report}
 
 
-def generate_weekly_predictions(min_percentage: float = None,
-                                shot_thresholds=None, sot_thresholds=None,
-                                recent_n_overall: int = None,
-                                recent_n_opponent: int = None,
-                                refresh_fixtures: bool = True,
-                                days_ahead: int = 7) -> pd.DataFrame:
+def _fallback_starters(players: pd.DataFrame, team_id: int, unavailable: set) -> pd.DataFrame:
     """
-    For every player likely to feature in the next `days_ahead` days' fixtures, build
-    their current feature row (using the opponent from their next match)
-    and score it with the saved model. Returns the predictions DataFrame
-    and also persists it (timestamped) to the `predictions` table.
+    When FotMob has no lineup yet: players who started at least 3 of the
+    team's last 5 matches, whose latest appearance was for this team, and
+    who aren't listed as unavailable.
+    """
+    team_rows = players[players.team_id == team_id]
+    last5 = team_rows.drop_duplicates("match_id").sort_values("date").tail(5).match_id
+    starts = team_rows[team_rows.match_id.isin(last5) & (team_rows.started == 1)]
+    counts = starts.groupby("player_id").size()
+    latest = players.sort_values("date").groupby("player_id").tail(1).set_index("player_id")
+    keep = [pid for pid, n in counts.items()
+            if n >= 3 and latest.loc[pid, "team_id"] == team_id and pid not in unavailable]
+    return latest.loc[keep, ["player_name", "position"]].reset_index().assign(team_id=team_id)
+
+
+def expected_lineups(upcoming: pd.DataFrame, players: pd.DataFrame, session=None, log=print):
+    """
+    Expected starters for each upcoming fixture: FotMob's predicted (or
+    confirmed) XI when published, else the fallback heuristic.
+    Returns (player rows, team rows) shaped for features.build_features.
+    """
+    session = session or scraper._session()
+    p_rows, t_rows = [], []
+    for m in upcoming.to_dict("records"):
+        try:
+            lu = scraper.parse_upcoming_lineup(scraper.fetch_upcoming_details(m["match_id"], session), m)
+        except scraper.BlockedError:
+            raise
+        except Exception as e:
+            log(f"[lineups] {m['home_team']} v {m['away_team']}: {e} - using fallback")
+            lu = {"starters": pd.DataFrame(), "unavailable": set(), "lineup_type": None}
+
+        sides = ((m["home_team_id"], m["home_team"], m["away_team_id"], m["away_team"], 1),
+                 (m["away_team_id"], m["away_team"], m["home_team_id"], m["home_team"], 0))
+        for team_id, team, opp_id, opp, is_home in sides:
+            team_id, opp_id = int(team_id), int(opp_id)
+            starters = lu["starters"]
+            starters = starters[starters.team_id == team_id] if not starters.empty else starters
+            lineup_type = lu["lineup_type"]
+            if starters.empty:
+                starters, lineup_type = _fallback_starters(players, team_id, lu["unavailable"]), "estimated"
+            base = {"match_id": m["match_id"], "date": m["date"], "competition": m["competition"],
+                    "season": m["season"], "kickoff_utc": m["kickoff_utc"]}
+            t_rows.append({**base, "team_id": team_id, "team": team, "opponent_id": opp_id,
+                           "opponent": opp, "is_home": is_home})
+            for s in starters.to_dict("records"):
+                p_rows.append({**base, "player_id": int(s["player_id"]), "player_name": s["player_name"],
+                               "team_id": team_id, "team": team, "opponent_id": opp_id,
+                               "opponent": opp, "is_home": is_home, "started": 1,
+                               "position": s.get("position"), "lineup_type": lineup_type})
+    return pd.DataFrame(p_rows), pd.DataFrame(t_rows)
+
+
+def generate_weekly_predictions(min_percentage: float = None, shot_thresholds=None,
+                                sot_thresholds=None, refresh_fixtures: bool = True,
+                                days_ahead: int = 7, log=print) -> pd.DataFrame:
+    """
+    For every expected starter in the next `days_ahead` days' fixtures,
+    build their feature row and score it with the saved model. Returns the
+    predictions and persists them (timestamped) to the `predictions` table.
     """
     db.init_db()
+    if not os.path.exists(config.MODEL_BUNDLE_PATH):
+        raise FileNotFoundError("No trained model yet - run a retrain first.")
     upcoming = upcoming_fixtures(days_ahead, refresh=refresh_fixtures)
-    if upcoming.empty:
+    players, teams = _history()
+    if upcoming.empty or players.empty:
         return pd.DataFrame()
 
-    raw = db.load_player_match_stats()
-    if raw.empty:
-        return pd.DataFrame()
-
-    recent_n_overall = recent_n_overall or config.RECENT_N_OVERALL
-    recent_n_opponent = recent_n_opponent or config.RECENT_N_OPPONENT
-    min_percentage = min_percentage if min_percentage is not None else config.DEFAULT_MIN_PERCENTAGE
     shot_thresholds = shot_thresholds or config.DEFAULT_SHOT_THRESHOLDS
     sot_thresholds = sot_thresholds or config.DEFAULT_SOT_THRESHOLDS
 
-    pred_rows = features.build_upcoming_feature_rows(
-        raw, upcoming, recent_n_overall, recent_n_opponent
-    )
-    if pred_rows.empty:
+    up_players, up_teams = expected_lineups(upcoming, players, log=log)
+    if up_players.empty:
+        return pd.DataFrame()
+    feat = features.build_features(players, teams, up_players, up_teams)
+    rows = feat[(feat.is_future == 1) & feat.position.isin(features.POSITIONS)]
+    if rows.empty:
         return pd.DataFrame()
 
-    scored = train.predict(pred_rows, shot_thresholds, sot_thresholds, min_percentage)
+    scored = train.predict(rows, shot_thresholds, sot_thresholds)
     scored["generated_at"] = _now()
-
-    # prob_json carries every threshold probability; the eligible_* columns
-    # are recomputed at display time from prob_json + the slider.
+    scored["sample_size_overall"] = scored["form_games"].astype(int)
+    scored["sample_size_vs_opp"] = scored["h2h_player_n"].astype(int)
     db.save_predictions(scored[db.PREDICTION_COLS])
-    return scored
+    return scored.sort_values(["kickoff_utc", "match_id", "pred_shots"], ascending=[True, True, False])
+
+
+# ---------------------------------------------------------------------------
+# Publishing
+# ---------------------------------------------------------------------------
+
+def publish_files(preds: pd.DataFrame) -> list:
+    """
+    Write the small files the deployed app reads (the database itself
+    stays local). Returns the paths written.
+    """
+    out = []
+    if preds is not None and not preds.empty:
+        path = os.path.join(config.PUBLISHED_DIR, "predictions_latest.csv")
+        preds[db.PREDICTION_COLS].to_csv(path, index=False)
+        out.append(path)
+    record = evaluate.track_record()
+    path = os.path.join(config.PUBLISHED_DIR, "track_record.csv")
+    record.to_csv(path, index=False)
+    out.append(path)
+    path = os.path.join(config.PUBLISHED_DIR, "model_report.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(db.latest_model_report(), f, indent=1, default=str)
+    out.append(path)
+    return out
+
+
+def post_to_telegram(preds: pd.DataFrame, min_percentage: float = None, within_hours: int = 36,
+                     dry_run: bool = False, log=print) -> dict:
+    """
+    Post picks for fixtures kicking off within `within_hours` that haven't
+    been posted yet. Each fixture is posted once; dry_run prints instead.
+    """
+    min_percentage = config.DEFAULT_MIN_PERCENTAGE if min_percentage is None else min_percentage
+    if preds is None or preds.empty:
+        return {"posted": 0, "reason": "no predictions"}
+    token, chat_id = telegram.credentials()
+    if not dry_run and not (token and chat_id):
+        return {"posted": 0, "reason": "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set (see src/telegram.py)"}
+
+    now = datetime.now(timezone.utc)
+    kickoff = pd.to_datetime(preds["kickoff_utc"], utc=True, format="ISO8601")
+    window = preds[(kickoff > now) & (kickoff <= now + timedelta(hours=within_hours))]
+    window = window[~window.match_id.isin(db.posted_match_ids())]
+    matches = db.load_matches(seasons=[config.CURRENT_SEASON])
+    matches = matches[matches.match_id.isin(window.match_id.unique())]
+    messages = telegram.build_messages(matches, window, min_percentage)
+
+    sent = 0
+    for text, match_ids in messages:
+        if dry_run:
+            log("----- (dry run) -----\n" + text)
+            continue
+        msg_id = telegram.send_message(text, token, chat_id)
+        for mid in match_ids:
+            lt = window.loc[window.match_id == mid, "lineup_type"].iloc[0]
+            db.record_telegram_post(mid, lt, [msg_id])
+        sent += 1
+    return {"posted": sent, "messages": len(messages), "dry_run": dry_run,
+            "fixtures": int(matches.shape[0])}

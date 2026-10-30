@@ -65,12 +65,51 @@ USER_AGENT = (
 )
 
 # ---------------------------------------------------------------------------
-# Feature engineering defaults (all overridable from the Streamlit sidebar)
+# Feature engineering
 # ---------------------------------------------------------------------------
-RECENT_N_OVERALL = 5          # rolling window for a player's general form
-RECENT_N_OPPONENT = 3         # rolling window for form vs this exact opponent
-MIN_MINUTES_TO_COUNT = 45     # ignore appearances shorter than this (applied in features, not at storage)
-MIN_SAMPLE_SIZE_WARNING = 3   # flag predictions built on fewer than N games
+# Recent form is an exponentially weighted average over the player's prior
+# appearances: with a half-life of 3 games, last game counts 1.0, three games
+# ago 0.5, six games ago 0.25 — so the last 4-7 games carry nearly all the
+# weight. Per 90 minutes, so being subbed at 60' isn't mistaken for bad form.
+FORM_HALFLIFE_GAMES = 3
+LONG_RUN_HALFLIFE_GAMES = 20     # the slower "what is this player normally" rate
+TEAM_FORM_HALFLIFE_GAMES = 4     # team attack/defence form
+H2H_HALFLIFE_MEETINGS = 2        # most recent meetings count most
+H2H_SHRINK_MEETINGS = 2          # H2H effect is pulled toward "no effect" until there are a few meetings
+BASELINE_PRIOR_MINUTES = 450     # a player with little history is pulled toward his position's average
+MIN_SAMPLE_SIZE_WARNING = 3      # flag predictions built on fewer than N prior games
+
+# Derbies, by FotMob team name. H2H history already captures how a pairing
+# tends to go; this flag adds the "it's a derby" effect for pairings with
+# few meetings in the data.
+DERBIES = [
+    ("Arsenal", "Tottenham Hotspur"), ("Arsenal", "Chelsea"), ("Chelsea", "Tottenham Hotspur"),
+    ("Liverpool", "Everton"), ("Liverpool", "Manchester United"),
+    ("Manchester City", "Manchester United"), ("Newcastle United", "Sunderland"),
+    ("Crystal Palace", "Brighton & Hove Albion"), ("Aston Villa", "Birmingham City"),
+    ("Real Madrid", "Atlético Madrid"), ("Real Madrid", "Barcelona"), ("Barcelona", "Espanyol"),
+    ("Sevilla", "Real Betis"), ("Athletic Club", "Real Sociedad"), ("Valencia", "Villarreal"),
+    ("Celta Vigo", "Deportivo A Coruña"),
+    ("Milan", "Inter"), ("Inter", "Juventus"), ("Roma", "Lazio"), ("Juventus", "Torino"),
+    ("Genoa", "Sampdoria"), ("Napoli", "Roma"),
+    ("Bayern München", "Borussia Dortmund"), ("Borussia Dortmund", "Schalke 04"),
+    ("Hamburger SV", "Werder Bremen"), ("1. FC Köln", "Borussia Mönchengladbach"),
+    ("Paris Saint-Germain", "Marseille"), ("Lyon", "Saint-Étienne"), ("Nice", "Monaco"),
+    ("Lens", "Lille"), ("Paris Saint-Germain", "Paris FC"),
+]
+
+# ---------------------------------------------------------------------------
+# Publishing
+# ---------------------------------------------------------------------------
+# Small files the deployed app reads (the full database stays local).
+PUBLISHED_DIR = os.path.join(DATA_DIR, "published")
+os.makedirs(PUBLISHED_DIR, exist_ok=True)
+
+# Telegram: the bot token and chat id are read from the environment or from
+# a local, git-ignored `.env` file — never from this file.
+TELEGRAM_MAX_PICKS_PER_MATCH = 4
+TELEGRAM_FOOTER = ("Model probabilities from recent form, head-to-head and team context. "
+                   "Lineups are FotMob's predicted XI unless marked confirmed. Not betting advice.")
 
 # ---------------------------------------------------------------------------
 # Prediction thresholds (defaults — adjustable live in the app)
@@ -80,16 +119,7 @@ DEFAULT_SOT_THRESHOLDS = [1, 2]
 DEFAULT_MIN_PERCENTAGE = 0.60   # confidence (predicted probability) required to flag "eligible"
 
 # ---------------------------------------------------------------------------
-# Drift detection
-# ---------------------------------------------------------------------------
-PSI_WARNING = 0.10
-PSI_ALERT = 0.25
-DRIFT_BASELINE_WEEKS = 4   # first N weeks of the current season = the baseline distribution
-
-# ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
-MODEL_SHOTS_PATH = os.path.join(MODELS_DIR, "model_shots.joblib")
-MODEL_SOT_PATH = os.path.join(MODELS_DIR, "model_sot.joblib")
-FEATURE_LIST_PATH = os.path.join(MODELS_DIR, "feature_list.json")
-TEST_HOLDOUT_WEEKS = 3   # most recent N weeks held out for time-based validation
+MODEL_BUNDLE_PATH = os.path.join(MODELS_DIR, "model_bundle.joblib")
+TEST_HOLDOUT_WEEKS = 4   # most recent N weeks held out for model selection / evaluation

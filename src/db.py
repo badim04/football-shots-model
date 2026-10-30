@@ -9,6 +9,7 @@ competitions, would otherwise silently merge into one history.
 """
 
 import contextlib
+import json
 import sqlite3
 from datetime import datetime, timezone
 
@@ -131,6 +132,20 @@ CREATE TABLE IF NOT EXISTS predictions (
     PRIMARY KEY (generated_at, match_id, player_id)
 );
 
+CREATE TABLE IF NOT EXISTS model_runs (
+    trained_at       TEXT PRIMARY KEY,
+    report_json      TEXT      -- holdout comparison, chosen model, calibration
+);
+
+CREATE TABLE IF NOT EXISTS telegram_posts (
+    match_id         TEXT NOT NULL,
+    kind             TEXT NOT NULL,     -- 'picks'
+    lineup_type      TEXT,              -- what the post was based on: predicted | confirmed
+    posted_at        TEXT NOT NULL,
+    message_ids      TEXT,
+    PRIMARY KEY (match_id, kind)
+);
+
 CREATE TABLE IF NOT EXISTS model_metrics (
     retrain_ts       TEXT PRIMARY KEY,
     mae_shots        REAL,
@@ -174,7 +189,16 @@ UNAVAILABLE_COLS = [
 PREDICTION_COLS = [
     "generated_at", "match_id", "player_id", "player_name", "team_id", "team", "opponent",
     "date", "competition", "pred_shots", "pred_sot", "sample_size_overall",
-    "sample_size_vs_opp", "prob_json",
+    "sample_size_vs_opp", "prob_json", "kickoff_utc", "position", "lineup_type", "model_kind",
+]
+
+# Columns added after a table was first created: (table, column, type).
+# init_db adds any that are missing, so existing databases keep their data.
+ADDED_COLUMNS = [
+    ("predictions", "kickoff_utc", "TEXT"),
+    ("predictions", "position", "TEXT"),
+    ("predictions", "lineup_type", "TEXT"),
+    ("predictions", "model_kind", "TEXT"),
 ]
 
 
@@ -184,7 +208,9 @@ def _now() -> str:
 
 @contextlib.contextmanager
 def get_conn():
-    conn = sqlite3.connect(config.DB_PATH)
+    # A generous timeout: the backfill may be writing while the app or a
+    # prediction run reads/writes.
+    conn = sqlite3.connect(config.DB_PATH, timeout=60)
     try:
         yield conn
         conn.commit()
@@ -205,6 +231,10 @@ def init_db():
                 "Move or delete it and re-run the backfill (scripts/backfill.py)."
             )
         conn.executescript(SCHEMA)
+        for table, column, col_type in ADDED_COLUMNS:
+            existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -387,6 +417,47 @@ def latest_predictions() -> pd.DataFrame:
         return pd.read_sql(
             "SELECT * FROM predictions WHERE generated_at = ?", conn, params=(latest_ts,)
         )
+
+
+def save_model_run(report: dict, trained_at: str):
+    with get_conn() as conn:
+        conn.execute("INSERT OR REPLACE INTO model_runs (trained_at, report_json) VALUES (?, ?)",
+                     (trained_at, json.dumps(report, default=str)))
+
+
+def latest_model_report() -> dict:
+    with get_conn() as conn:
+        row = conn.execute("SELECT report_json FROM model_runs ORDER BY trained_at DESC LIMIT 1").fetchone()
+    return json.loads(row[0]) if row else {}
+
+
+def latest_predictions_before_kickoff() -> pd.DataFrame:
+    """
+    For each (match, player), the last prediction made before kickoff —
+    what was actually "on the record" for that match. Used for the track record.
+    """
+    with get_conn() as conn:
+        return pd.read_sql("""
+            SELECT p.* FROM predictions p
+            JOIN (SELECT match_id, player_id, MAX(generated_at) AS g FROM predictions
+                  WHERE kickoff_utc IS NULL OR generated_at < kickoff_utc
+                  GROUP BY match_id, player_id) last
+              ON p.match_id = last.match_id AND p.player_id = last.player_id AND p.generated_at = last.g
+        """, conn)
+
+
+def posted_match_ids(kind: str = "picks") -> dict:
+    """{match_id: lineup_type it was posted with}."""
+    with get_conn() as conn:
+        return dict(conn.execute("SELECT match_id, lineup_type FROM telegram_posts WHERE kind = ?",
+                                 (kind,)).fetchall())
+
+
+def record_telegram_post(match_id: str, lineup_type: str, message_ids: list, kind: str = "picks"):
+    with get_conn() as conn:
+        conn.execute("INSERT OR REPLACE INTO telegram_posts (match_id, kind, lineup_type, posted_at, "
+                     "message_ids) VALUES (?, ?, ?, ?, ?)",
+                     (match_id, kind, lineup_type, _now(), json.dumps(message_ids)))
 
 
 def save_model_metrics(row: dict):

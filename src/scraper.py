@@ -356,6 +356,44 @@ def parse_match_details(details: dict, match: dict) -> dict:
     }
 
 
+def fetch_upcoming_details(match_id: str, session: requests.Session = None) -> dict:
+    """matchDetails for a match that hasn't finished — never cached (lineups change)."""
+    return _get_json(session or _session(), "matchDetails", {"matchId": match_id})
+
+
+def parse_upcoming_lineup(details: dict, match: dict) -> dict:
+    """
+    FotMob's expected starting XI for an upcoming match, and who's out.
+    `lineup_type` is "predicted" (FotMob's forecast, days ahead) or the
+    confirmed team sheet once it's published (~1 hour before kickoff).
+
+    Returns {"starters": DataFrame, "unavailable": set of player_ids, "lineup_type": str|None}.
+    """
+    lineup = (details.get("content") or {}).get("lineup") or {}
+    lineup_type = lineup.get("lineupType")
+    home_id, away_id = int(match["home_team_id"]), int(match["away_team_id"])
+    rows, out = [], set()
+    for side in ("homeTeam", "awayTeam"):
+        t = lineup.get(side) or {}
+        if "id" not in t:
+            continue
+        team_id = int(t["id"])
+        if team_id not in (home_id, away_id):
+            continue
+        out.update(int(u["id"]) for u in t.get("unavailable") or [])
+        for s in t.get("starters") or []:
+            usual = s.get("usualPlayingPositionId")
+            rows.append({
+                "player_id": int(s["id"]),
+                "player_name": s.get("name"),
+                "team_id": team_id,
+                "position": POSITION_LABELS.get(usual),
+            })
+    return {"starters": pd.DataFrame(rows), "unavailable": out,
+            "lineup_type": ("confirmed" if lineup_type and lineup_type != "predicted" else lineup_type)
+            if rows else None}
+
+
 # ---------------------------------------------------------------------------
 # Date-range helpers
 # ---------------------------------------------------------------------------
