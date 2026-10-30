@@ -4,7 +4,7 @@ upcoming fixtures with FotMob's expected lineups → publish → Telegram.
 
     python scripts/run_daily.py                          # everything except Telegram
     python scripts/run_daily.py --telegram --dry-run     # print the Telegram posts, send nothing
-    python scripts/run_daily.py --telegram               # post picks for the next 36 hours
+    python scripts/run_daily.py --telegram               # post today's top picks (next 24 hours)
 
 Run it once a day (Windows Task Scheduler — see README). Each fixture is
 posted to Telegram once, so running it more often never double-posts.
@@ -36,9 +36,11 @@ def main():
     ap.add_argument("--days", type=int, default=7, help="predict fixtures this many days ahead")
     ap.add_argument("--telegram", action="store_true", help="post picks to Telegram")
     ap.add_argument("--dry-run", action="store_true", help="with --telegram: print instead of sending")
-    ap.add_argument("--within-hours", type=int, default=36,
-                    help="post fixtures kicking off within this many hours")
-    ap.add_argument("--min-prob", type=float, default=config.DEFAULT_MIN_PERCENTAGE,
+    ap.add_argument("--within-hours", type=int, default=24,
+                    help="the daily post covers fixtures kicking off within this many hours")
+    ap.add_argument("--top", type=int, default=config.TELEGRAM_TOP_N,
+                    help="max players in the daily post")
+    ap.add_argument("--min-prob", type=float, default=config.TELEGRAM_MIN_PROB,
                     help="probability a line must reach to be posted")
     ap.add_argument("--skip-update", action="store_true", help="don't fetch new results first")
     ap.add_argument("--force-retrain", action="store_true")
@@ -78,7 +80,8 @@ def main():
         print(f"[publish] {os.path.relpath(path, config.BASE_DIR)}")
 
     if args.telegram:
-        result = pipeline.post_to_telegram(preds, args.min_prob, args.within_hours, dry_run=args.dry_run)
+        result = pipeline.post_to_telegram(preds, args.min_prob, args.within_hours, args.top,
+                                           dry_run=args.dry_run)
         print(f"[telegram] {json.dumps(result)}")
 
 

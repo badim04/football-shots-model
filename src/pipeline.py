@@ -280,13 +280,16 @@ def publish_files(preds: pd.DataFrame) -> list:
     return out
 
 
-def post_to_telegram(preds: pd.DataFrame, min_percentage: float = None, within_hours: int = 36,
-                     dry_run: bool = False, log=print) -> dict:
+def post_to_telegram(preds: pd.DataFrame, min_percentage: float = None, within_hours: int = 24,
+                     top_n: int = None, dry_run: bool = False, log=print) -> dict:
     """
-    Post picks for fixtures kicking off within `within_hours` that haven't
-    been posted yet. Each fixture is posted once; dry_run prints instead.
+    One daily digest: the top_n most confident players across fixtures
+    kicking off within `within_hours`. Posts at most once per day, and a
+    fixture already covered by an earlier digest is never included again.
+    dry_run prints instead.
     """
-    min_percentage = config.DEFAULT_MIN_PERCENTAGE if min_percentage is None else min_percentage
+    min_percentage = config.TELEGRAM_MIN_PROB if min_percentage is None else min_percentage
+    top_n = config.TELEGRAM_TOP_N if top_n is None else top_n
     if preds is None or preds.empty:
         return {"posted": 0, "reason": "no predictions"}
     token, chat_id = telegram.credentials()
@@ -294,22 +297,28 @@ def post_to_telegram(preds: pd.DataFrame, min_percentage: float = None, within_h
         return {"posted": 0, "reason": "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set (see src/telegram.py)"}
 
     now = datetime.now(timezone.utc)
+    day_key = f"day:{now:%Y-%m-%d}"
+    posted = db.posted_match_ids(kind="digest")
+    if day_key in posted and not dry_run:
+        return {"posted": 0, "reason": "today's digest was already posted"}
+
     kickoff = pd.to_datetime(preds["kickoff_utc"], utc=True, format="ISO8601")
     window = preds[(kickoff > now) & (kickoff <= now + timedelta(hours=within_hours))]
-    window = window[~window.match_id.isin(db.posted_match_ids())]
-    matches = db.load_matches(seasons=[config.CURRENT_SEASON])
-    matches = matches[matches.match_id.isin(window.match_id.unique())]
-    messages = telegram.build_messages(matches, window, min_percentage)
+    window = window[~window.match_id.isin(posted)]
+    title = f"Shots picks — {now:%a %d %b}"
+    messages = telegram.build_digest(window, min_percentage, top_n, title)
 
     sent = 0
-    for text, match_ids in messages:
+    for text, _ in messages:
         if dry_run:
             log("----- (dry run) -----\n" + text)
             continue
         msg_id = telegram.send_message(text, token, chat_id)
-        for mid in match_ids:
-            lt = window.loc[window.match_id == mid, "lineup_type"].iloc[0]
-            db.record_telegram_post(mid, lt, [msg_id])
         sent += 1
+    if sent:
+        for mid in window.match_id.unique():
+            lt = window.loc[window.match_id == mid, "lineup_type"].iloc[0]
+            db.record_telegram_post(mid, lt, [], kind="digest")
+        db.record_telegram_post(day_key, None, [], kind="digest")
     return {"posted": sent, "messages": len(messages), "dry_run": dry_run,
-            "fixtures": int(matches.shape[0])}
+            "fixtures": int(window.match_id.nunique())}

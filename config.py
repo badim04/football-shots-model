@@ -107,7 +107,8 @@ os.makedirs(PUBLISHED_DIR, exist_ok=True)
 
 # Telegram: the bot token and chat id are read from the environment or from
 # a local, git-ignored `.env` file — never from this file.
-TELEGRAM_MAX_PICKS_PER_MATCH = 4
+TELEGRAM_TOP_N = 20          # players per daily post
+TELEGRAM_MIN_PROB = 0.80     # a player needs a line at least this likely to be posted
 TELEGRAM_FOOTER = ("Model probabilities from recent form, head-to-head and team context. "
                    "Lineups are FotMob's predicted XI unless marked confirmed. Not betting advice.")
 

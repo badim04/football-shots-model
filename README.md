@@ -107,12 +107,15 @@ seasons are in. Re-run `scripts/evaluate.py` after the backfill.
    python scripts/run_daily.py --telegram
    ```
 
-Each run posts fixtures kicking off in the next **36 hours**
-(`--within-hours`). Each fixture is posted **once**, so running the job
-more often never double-posts. A post lists up to 4 players per match
-whose line clears the confidence bar (`--min-prob`, default 60%). Each
-player shows at most 2 lines, plus xShots/xSOT and a ⚠️ when history is
-thin.
+Each day gets **one post**: the **top 20 players** across every game
+kicking off in the next 24 hours, best first. A player only makes the list
+if one of their lines is at least **80%** likely. The post shows the
+player, the game and kickoff, the lines that clear 80% (at most 2), and
+xShots. ⚠️ means thin history, and "XI est." means FotMob hasn't
+published a lineup yet. The job posts at most once a day, and a game
+already covered is never posted again. Change the defaults with `--top`,
+`--min-prob` and `--within-hours`, or with `TELEGRAM_TOP_N` and
+`TELEGRAM_MIN_PROB` in `config.py`.
 
 ## Running it every day (Windows Task Scheduler)
 

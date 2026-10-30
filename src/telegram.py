@@ -76,66 +76,47 @@ def _qualifying_lines(prob_json: str, min_prob: float) -> list:
     return hits[:2]
 
 
-def format_match_block(match: pd.Series, preds: pd.DataFrame, min_prob: float) -> str:
-    """One fixture's picks, or '' if no player clears min_prob on any line."""
+def _pick_line(r: pd.Series, lines: list) -> str:
+    line_txt = " · ".join(f"{LINE_LABELS[k]} {v:.0%}" for k, v in lines)
+    kickoff = pd.to_datetime(r["kickoff_utc"], format="ISO8601").strftime("%H:%M")
+    notes = (" ⚠️" if r.get("sample_size_overall", 7) < config.MIN_SAMPLE_SIZE_WARNING else "") +             (" (XI est.)" if r.get("lineup_type") == "estimated" else "")
+    return (f"<b>{html.escape(r['player_name'])}</b> ({html.escape(r['team'])} v "
+            f"{html.escape(r['opponent'])}, {kickoff}) — {line_txt} "
+            f"<i>(xShots {r['pred_shots']:.1f})</i>{notes}")
+
+
+def build_digest(preds: pd.DataFrame, min_prob: float, top_n: int, title: str) -> list:
+    """
+    One ranked list of the most confident players across all the given
+    fixtures: everyone with a line at >= min_prob, best first, capped at
+    top_n. Returns [(text, [match_ids covered])], split to fit Telegram's
+    length limit; [] if nobody qualifies.
+    """
     picks = []
     for _, r in preds.iterrows():
         lines = _qualifying_lines(r["prob_json"], min_prob)
         if lines:
-            best = max(v for _, v in lines)
-            picks.append((best, r, lines))
+            picks.append((max(v for _, v in lines), r, lines))
     if not picks:
-        return ""
+        return []
     picks.sort(key=lambda x: -x[0])
-    picks = picks[:config.TELEGRAM_MAX_PICKS_PER_MATCH]
+    picks = picks[:top_n]
 
-    kickoff = pd.to_datetime(match["kickoff_utc"], format="ISO8601").strftime("%H:%M UTC")
-    lineup = preds["lineup_type"].iloc[0] if "lineup_type" in preds else None
-    lineup_note = {"confirmed": "✅ confirmed XI", "predicted": "predicted XI"}.get(lineup, "XI estimated")
-    out = [f"<b>{html.escape(match['home_team'])} vs {html.escape(match['away_team'])}</b>",
-           f"<i>{html.escape(match['competition'])} · {kickoff} · {lineup_note}</i>"]
-    for _, r, lines in picks:
-        line_txt = " · ".join(f"{LINE_LABELS[k]} {v:.0%}" for k, v in lines)
-        thin = " ⚠️" if r.get("sample_size_overall", 7) < config.MIN_SAMPLE_SIZE_WARNING else ""
-        out.append(f"• {html.escape(r['player_name'])} ({html.escape(r['team'])}) — {line_txt} "
-                   f"<i>(xShots {r['pred_shots']:.1f}, xSOT {r['pred_sot']:.1f})</i>{thin}")
-    return "\n".join(out)
-
-
-def build_messages(matches: pd.DataFrame, preds: pd.DataFrame, min_prob: float) -> list:
-    """
-    [(text, [match_ids in this message])] — matches grouped by day, split
-    across messages so none exceeds Telegram's length limit.
-    """
-    messages, current, current_ids = [], [], []
-
-    def flush():
-        if current:
-            messages.append(("\n\n".join(current), list(current_ids)))
-            current.clear()
-            current_ids.clear()
-
-    day_header = None
-    for _, m in matches.sort_values("kickoff_utc").iterrows():
-        block = format_match_block(m, preds[preds.match_id == m["match_id"]], min_prob)
-        if not block:
-            continue
-        day = pd.to_datetime(m["kickoff_utc"], format="ISO8601").strftime("%a %d %b")
-        if day != day_header:
-            header = f"⚽ <b>Shots picks — {day}</b>  (≥{min_prob:.0%} model probability)"
-            if sum(len(x) for x in current) + len(header) > MAX_MESSAGE_CHARS * 0.7:
-                flush()
-            current.append(header)
-            day_header = day
-        if sum(len(x) + 2 for x in current) + len(block) > MAX_MESSAGE_CHARS:
-            flush()
-            current.append(f"⚽ <b>Shots picks — {day}</b> (cont.)")
-        current.append(block)
-        current_ids.append(m["match_id"])
-    if current:
-        current.append(f"<i>{html.escape(config.TELEGRAM_FOOTER, quote=False)}</i>")
-    flush()
-    return messages
+    match_ids = sorted(preds.match_id.unique())
+    header = (f"⚽ <b>{html.escape(title)}</b>\n"
+              f"<i>Top {len(picks)} players at ≥{min_prob:.0%} model probability · "
+              f"{len(match_ids)} games · kickoff times UTC</i>")
+    footer = f"<i>{html.escape(config.TELEGRAM_FOOTER, quote=False)}</i>"
+    messages, current = [], [header]
+    for i, (_, r, lines) in enumerate(picks, 1):
+        row = f"{i}. {_pick_line(r, lines)}"
+        if sum(len(x) + 1 for x in current) + len(row) > MAX_MESSAGE_CHARS:
+            messages.append("\n".join(current))
+            current = [f"⚽ <b>{html.escape(title)}</b> (cont.)"]
+        current.append(row)
+    current += ["", footer]
+    messages.append("\n".join(current))
+    return [(m, match_ids) for m in messages]
 
 
 def format_track_record(summary: pd.DataFrame, since: str) -> str:
