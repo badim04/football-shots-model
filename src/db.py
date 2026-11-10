@@ -139,11 +139,27 @@ CREATE TABLE IF NOT EXISTS model_runs (
 
 CREATE TABLE IF NOT EXISTS telegram_posts (
     match_id         TEXT NOT NULL,
-    kind             TEXT NOT NULL,     -- 'picks'
+    kind             TEXT NOT NULL,     -- 'block' (match_id = block key) | 'results' | legacy 'picks'/'digest'
     lineup_type      TEXT,              -- what the post was based on: predicted | confirmed
     posted_at        TEXT NOT NULL,
     message_ids      TEXT,
     PRIMARY KEY (match_id, kind)
+);
+
+-- every pick that went out in a Telegram block post, so results are
+-- reported on exactly what was posted
+CREATE TABLE IF NOT EXISTS telegram_picks (
+    block_key        TEXT NOT NULL,
+    match_id         TEXT NOT NULL,
+    player_id        INTEGER NOT NULL,
+    player_name      TEXT,
+    team             TEXT,
+    opponent         TEXT,
+    kickoff_utc      TEXT,
+    line             TEXT NOT NULL,     -- e.g. 'shots>=3'
+    prob             REAL,
+    posted_at        TEXT NOT NULL,
+    PRIMARY KEY (block_key, match_id, player_id, line)
 );
 
 CREATE TABLE IF NOT EXISTS model_metrics (
@@ -458,6 +474,22 @@ def record_telegram_post(match_id: str, lineup_type: str, message_ids: list, kin
         conn.execute("INSERT OR REPLACE INTO telegram_posts (match_id, kind, lineup_type, posted_at, "
                      "message_ids) VALUES (?, ?, ?, ?, ?)",
                      (match_id, kind, lineup_type, _now(), json.dumps(message_ids)))
+
+
+def save_telegram_picks(picks: pd.DataFrame):
+    cols = ["block_key", "match_id", "player_id", "player_name", "team", "opponent",
+            "kickoff_utc", "line", "prob", "posted_at"]
+    with get_conn() as conn:
+        conn.executemany(f"INSERT OR REPLACE INTO telegram_picks ({', '.join(cols)}) "
+                         f"VALUES ({', '.join('?' for _ in cols)})", _rows(picks, cols))
+
+
+def load_telegram_picks(block_key: str = None) -> pd.DataFrame:
+    q, params = "SELECT * FROM telegram_picks", []
+    if block_key:
+        q, params = q + " WHERE block_key = ?", [block_key]
+    with get_conn() as conn:
+        return pd.read_sql(q, conn, params=params)
 
 
 def save_model_metrics(row: dict):

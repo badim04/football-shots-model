@@ -107,15 +107,32 @@ os.makedirs(PUBLISHED_DIR, exist_ok=True)
 
 # Telegram: the bot token and chat id are read from the environment or from
 # a local, git-ignored `.env` file — never from this file.
-TELEGRAM_TOP_N = 20          # players per daily post
-TELEGRAM_MIN_PROB = 0.80     # a player needs a line at least this likely to be posted
+#
+# Posting follows Lagos time (WAT, UTC+1, no daylight saving), not the PC's
+# clock, which may be set to another zone.
+LOCAL_UTC_OFFSET_HOURS = 1
+LOCAL_TZ_LABEL = "WAT"
+# Fixtures are posted in blocks, by local kickoff date (Mon=0 ... Sun=6).
+# A block opens BLOCK_OPENS_DAYS_BEFORE days before its first day at
+# BLOCK_OPENS_HOUR; the first run after that posts it. A late run (PC was
+# off) still posts whatever in the block hasn't kicked off yet.
+POST_BLOCKS = [("Tue-Thu", [1, 2, 3]), ("Fri-Sat", [4, 5]), ("Sun-Mon", [6, 0])]
+BLOCK_OPENS_DAYS_BEFORE = 1
+BLOCK_OPENS_HOUR = 10
+# Each block post lists the TELEGRAM_TOP_N players with the most expected
+# shots, each with these lines' probabilities and fair odds. Higher lines
+# are never "sure" - what matters is whether the bookmaker's odds beat the
+# fair odds.
+TELEGRAM_TOP_N = 20
+TELEGRAM_LINES = ["shots>=2", "shots>=3", "shots>=4", "sot>=1"]
+VALUE_MARGIN = 1.10   # suggest betting only at odds >= fair odds x this
 TELEGRAM_FOOTER = ("Model probabilities from recent form, head-to-head and team context. "
                    "Lineups are FotMob's predicted XI unless marked confirmed. Not betting advice.")
 
 # ---------------------------------------------------------------------------
 # Prediction thresholds (defaults — adjustable live in the app)
 # ---------------------------------------------------------------------------
-DEFAULT_SHOT_THRESHOLDS = [1, 2, 3]
+DEFAULT_SHOT_THRESHOLDS = [1, 2, 3, 4]
 DEFAULT_SOT_THRESHOLDS = [1, 2]
 DEFAULT_MIN_PERCENTAGE = 0.60   # confidence (predicted probability) required to flag "eligible"
 

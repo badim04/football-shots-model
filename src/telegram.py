@@ -16,7 +16,7 @@ written to the database, logs, or committed files.
 import html
 import json
 import os
-from datetime import datetime
+from datetime import timedelta, timezone
 
 import pandas as pd
 import requests
@@ -25,6 +25,7 @@ import config
 
 API = "https://api.telegram.org/bot{token}/{method}"
 MAX_MESSAGE_CHARS = 3900   # Telegram's limit is 4096; leave room for HTML entities
+LOCAL_TZ = timezone(timedelta(hours=config.LOCAL_UTC_OFFSET_HOURS))
 
 
 def _load_dotenv():
@@ -64,67 +65,96 @@ def send_message(text: str, token: str, chat_id: str) -> int:
 # ---------------------------------------------------------------------------
 
 LINE_LABELS = {"shots>=1": "1+ shots", "shots>=2": "2+ shots", "shots>=3": "3+ shots",
-               "sot>=1": "1+ SOT", "sot>=2": "2+ SOT"}
+               "shots>=4": "4+ shots", "sot>=1": "1+ SOT", "sot>=2": "2+ SOT"}
 
 
-def _qualifying_lines(prob_json: str, min_prob: float) -> list:
-    probs = json.loads(prob_json)
-    hits = [(k, v) for k, v in probs.items() if v >= min_prob and k in LINE_LABELS]
-    # The most demanding line a player clears is the most informative one;
-    # show at most two per player.
-    hits.sort(key=lambda kv: (kv[0].startswith("shots"), -int(kv[0].split(">=")[1])))
-    return hits[:2]
+def local_time(kickoff_utc):
+    """A kickoff (or a Series of them) in local time."""
+    t = pd.to_datetime(kickoff_utc, utc=True, format="ISO8601")
+    return t.dt.tz_convert(LOCAL_TZ) if isinstance(t, pd.Series) else t.tz_convert(LOCAL_TZ)
 
 
-def _pick_line(r: pd.Series, lines: list) -> str:
-    line_txt = " · ".join(f"{LINE_LABELS[k]} {v:.0%}" for k, v in lines)
-    kickoff = pd.to_datetime(r["kickoff_utc"], format="ISO8601").strftime("%H:%M")
-    notes = (" ⚠️" if r.get("sample_size_overall", 7) < config.MIN_SAMPLE_SIZE_WARNING else "") +             (" (XI est.)" if r.get("lineup_type") == "estimated" else "")
-    return (f"<b>{html.escape(r['player_name'])}</b> ({html.escape(r['team'])} v "
-            f"{html.escape(r['opponent'])}, {kickoff}) — {line_txt} "
-            f"<i>(xShots {r['pred_shots']:.1f})</i>{notes}")
-
-
-def build_digest(preds: pd.DataFrame, min_prob: float, top_n: int, title: str) -> list:
-    """
-    One ranked list of the most confident players across all the given
-    fixtures: everyone with a line at >= min_prob, best first, capped at
-    top_n. Returns [(text, [match_ids covered])], split to fit Telegram's
-    length limit; [] if nobody qualifies.
-    """
-    picks = []
-    for _, r in preds.iterrows():
-        lines = _qualifying_lines(r["prob_json"], min_prob)
-        if lines:
-            picks.append((max(v for _, v in lines), r, lines))
-    if not picks:
-        return []
-    picks.sort(key=lambda x: -x[0])
-    picks = picks[:top_n]
-
-    match_ids = sorted(preds.match_id.unique())
-    header = (f"⚽ <b>{html.escape(title)}</b>\n"
-              f"<i>Top {len(picks)} players at ≥{min_prob:.0%} model probability · "
-              f"{len(match_ids)} games · kickoff times UTC</i>")
-    footer = f"<i>{html.escape(config.TELEGRAM_FOOTER, quote=False)}</i>"
-    messages, current = [], [header]
-    for i, (_, r, lines) in enumerate(picks, 1):
-        row = f"{i}. {_pick_line(r, lines)}"
-        if sum(len(x) + 1 for x in current) + len(row) > MAX_MESSAGE_CHARS:
+def _split(lines: list, cont_header: str) -> list:
+    """Join lines into messages under Telegram's length limit."""
+    messages, current = [], []
+    for line in lines:
+        if current and sum(len(x) + 1 for x in current) + len(line) > MAX_MESSAGE_CHARS:
             messages.append("\n".join(current))
-            current = [f"⚽ <b>{html.escape(title)}</b> (cont.)"]
-        current.append(row)
-    current += ["", footer]
-    messages.append("\n".join(current))
-    return [(m, match_ids) for m in messages]
+            current = [cont_header]
+        current.append(line)
+    if current:
+        messages.append("\n".join(current))
+    return messages
 
 
-def format_track_record(summary: pd.DataFrame, since: str) -> str:
-    """A short 'how did the picks do' message from evaluate.track_record()."""
-    if summary.empty:
-        return ""
-    out = [f"📊 <b>Track record since {html.escape(since)}</b>"]
-    for _, r in summary.iterrows():
-        out.append(f"• {LINE_LABELS.get(r['line'], r['line'])}: {int(r['hits'])}/{int(r['picks'])} hit "
-                   f"({r['hit_rate']:.0%}) vs {r['avg_prob']:.0%} predicted")
-    return "\n".join(out)
+SHORT_LABELS = {"shots>=1": "1+", "shots>=2": "2+", "shots>=3": "3+", "shots>=4": "4+",
+                "sot>=1": "1+ SOT", "sot>=2": "2+ SOT"}
+
+
+def select_block_picks(preds: pd.DataFrame, top_n: int = None, lines: list = None) -> pd.DataFrame:
+    """
+    The top_n players by expected shots, as one row per (player, line) with
+    that line's probability - the form both the post and the results use.
+    """
+    top_n = top_n or config.TELEGRAM_TOP_N
+    lines = lines or config.TELEGRAM_LINES
+    top = preds.sort_values("pred_shots", ascending=False).head(top_n).reset_index(drop=True)
+    top["rank"] = top.index + 1
+    probs = top["prob_json"].apply(json.loads)
+    out = [top.assign(line=line, prob=probs.apply(lambda d: d.get(line))) for line in lines]
+    picks = pd.concat(out, ignore_index=True)
+    return picks[picks.prob.notna()].sort_values(["rank", "line"], kind="stable").reset_index(drop=True)
+
+
+def _players(picks: pd.DataFrame):
+    """(first row, that player's lines) per player, in rank order."""
+    order = picks.drop_duplicates(["match_id", "player_id"])
+    for r in order.itertuples():
+        yield r, picks[(picks.match_id == r.match_id) & (picks.player_id == r.player_id)]
+
+
+def build_block_post(picks: pd.DataFrame, title: str, n_games: int) -> list:
+    """The block's top players, each with every line's probability and fair odds."""
+    if picks.empty:
+        return []
+    lines = [f"⚽ <b>{html.escape(title)}</b>",
+             f"<i>Top {picks.player_id.nunique()} players by expected shots · {n_games} games · "
+             f"kickoff {config.LOCAL_TZ_LABEL} · % = model probability, @ = fair odds</i>"]
+    for i, (r, own) in enumerate(_players(picks), 1):
+        ko = local_time(r.kickoff_utc).strftime("%a %H:%M")
+        notes = (" ⚠️" if getattr(r, "sample_size_overall", 7) < config.MIN_SAMPLE_SIZE_WARNING else "") + \
+                (" (XI est.)" if getattr(r, "lineup_type", None) == "estimated" else "")
+        odds = " · ".join(f"{SHORT_LABELS.get(p.line, p.line)} {p.prob:.0%} @{1 / p.prob:.2f}"
+                          for p in own.itertuples())
+        lines += ["", f"{i}. <b>{html.escape(r.player_name)}</b> ({html.escape(r.team)} v "
+                      f"{html.escape(r.opponent)}, {ko}) <i>xShots {r.pred_shots:.1f}</i>{notes}",
+                  f"    {odds}"]
+    lines += ["", f"💡 Bet a line only when the bookmaker pays at least {config.VALUE_MARGIN:.2f}× "
+                  f"the fair odds (e.g. @2.00 → need 2.20+). Below that, skip it however likely it looks.",
+              f"<i>{html.escape(config.TELEGRAM_FOOTER, quote=False)}</i>"]
+    return _split(lines, f"⚽ <b>{html.escape(title)}</b> (cont.)")
+
+
+def build_results_post(settled: pd.DataFrame, title: str, season: pd.DataFrame) -> list:
+    """
+    How a block's posted players did: each player's shots/SOT with ✅/❌ per
+    line (➖ = didn't play, void), hits vs expected per line, and the
+    running total over every block posted so far.
+    """
+    lines = [f"📊 <b>{html.escape(title)}</b>", ""]
+    for r, own in _players(settled):
+        if not r.played:
+            lines.append(f"➖ {html.escape(r.player_name)} — didn't play")
+            continue
+        marks = " ".join(f"{SHORT_LABELS.get(p.line, p.line)} {'✅' if p.hit else '❌'}" for p in own.itertuples())
+        lines.append(f"{html.escape(r.player_name)}: {int(r.shots)} shots, {int(r.shots_on_target)} SOT — {marks}")
+
+    def summary(df):
+        live = df[df.played]
+        return [f"• {LINE_LABELS.get(line, line)}: {int(g.hit.sum())}/{len(g)} hit ({g.hit.mean():.0%}), "
+                f"model expected {g.prob.mean():.0%}" for line, g in live.groupby("line", sort=False)]
+    lines += ["", "<b>This block</b>"] + summary(settled)
+    if season.block_key.nunique() > 1:
+        lines += ["", f"<b>All {season.block_key.nunique()} blocks so far</b>"] + summary(season)
+    lines += ["", "<i>Hit rate close to the expected % = the probabilities can be trusted.</i>"]
+    return _split(lines, f"📊 <b>{html.escape(title)}</b> (cont.)")

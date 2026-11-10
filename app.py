@@ -62,8 +62,8 @@ tabs = st.tabs(["📋 Predictions", "📊 Track record"] + (["🛠 Admin"] if AD
 st.sidebar.header("Filters")
 min_percentage = st.sidebar.slider("Confidence to count as a pick (%)", 40, 95,
                                    int(config.DEFAULT_MIN_PERCENTAGE * 100)) / 100
-lines = st.sidebar.multiselect("Lines", ["shots>=1", "shots>=2", "shots>=3", "sot>=1", "sot>=2"],
-                               default=["shots>=1", "shots>=2", "shots>=3", "sot>=1", "sot>=2"])
+lines = st.sidebar.multiselect("Lines", ["shots>=1", "shots>=2", "shots>=3", "shots>=4", "sot>=1", "sot>=2"],
+                               default=["shots>=1", "shots>=2", "shots>=3", "shots>=4", "sot>=1", "sot>=2"])
 st.sidebar.caption("These only filter what's shown — the probabilities themselves come from the model.")
 
 # ---------------------------------------------------------------------------

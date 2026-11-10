@@ -19,15 +19,16 @@ Data comes from FotMob's public match data, not a paid API.
 pip install -r requirements.txt
 python scripts/backfill.py
 python scripts/run_daily.py --telegram --dry-run
-python scripts/run_daily.py --telegram
+python scripts/run_daily.py --auto
 streamlit run app.py
 ```
 
 - **`backfill.py`** is a one-time history download, about 7 hours. It can
   be stopped and resumed.
 - **`run_daily.py --telegram --dry-run`** fetches new results, retrains,
-  predicts, and *prints* the Telegram posts.
-- **`run_daily.py --telegram`** does the same and actually posts.
+  predicts, and *prints* the current and next block's Telegram posts.
+- **`run_daily.py --auto`** is what the scheduler runs. It posts a block
+  or results only when one is due.
 - **`streamlit run app.py`** opens the app.
 
 ---
@@ -101,34 +102,59 @@ seasons are in. Re-run `scripts/evaluate.py` after the backfill.
    TELEGRAM_CHAT_ID=@your_channel_username
    ```
    For a private channel, use its numeric id (`-100…`) instead.
-4. Preview what will be posted, then post for real:
+4. Preview what would be posted:
    ```bash
    python scripts/run_daily.py --telegram --dry-run
-   python scripts/run_daily.py --telegram
    ```
 
-Each day gets **one post**: the **top 20 players** across every game
-kicking off in the next 24 hours, best first. A player only makes the list
-if one of their lines is at least **80%** likely. The post shows the
-player, the game and kickoff, the lines that clear 80% (at most 2), and
-xShots. ⚠️ means thin history, and "XI est." means FotMob hasn't
-published a lineup yet. The job posts at most once a day, and a game
-already covered is never posted again. Change the defaults with `--top`,
-`--min-prob` and `--within-hours`, or with `TELEGRAM_TOP_N` and
-`TELEGRAM_MIN_PROB` in `config.py`.
+### What gets posted, and when
 
-## Running it every day (Windows Task Scheduler)
+Times are **Lagos time (WAT)**, whatever zone the PC's clock is set to
+(`LOCAL_UTC_OFFSET_HOURS` in `config.py`).
 
-This creates a task that runs the daily job at 09:00:
+Fixtures are grouped into three **blocks** a week, by kickoff day:
 
-```bash
-schtasks /Create /TN "Football shots daily" /SC DAILY /ST 09:00 /TR "cmd /c cd /d C:\Users\user\Documents\GitHub\football-shots-model && python scripts\run_daily.py --telegram >> logs\daily.log 2>&1"
+| Block | Usual games | Posted from |
+|---|---|---|
+| Tue–Thu | Champions / Europa / Conference League, midweek rounds | Mon 10:00 |
+| Fri–Sat | Most league games | Thu 10:00 |
+| Sun–Mon | The rest of the round | Sat 10:00 |
+
+- **Block post:** the **top 20 players by expected shots** in the block.
+  Each shows 2+, 3+ and 4+ shots and 1+ SOT, with the model's probability
+  and the **fair odds** (1 / probability). The rule is to bet a line only
+  when the bookmaker pays at least 1.10× the fair odds. ⚠️ means thin
+  history, and "XI est." means FotMob had no lineup yet.
+- **Results post:** once every game in a posted block has finished and its
+  stats are in. It shows each player's shots and SOT, ✅/❌ per line (➖ =
+  didn't play, so void), hits vs expected per line, and the running total
+  over all blocks.
+
+Each block is posted once. If the PC is off when a block opens, the next
+run posts whatever in the block hasn't kicked off yet. A block with no
+games (international breaks) is skipped. Every posted pick is stored in
+the `telegram_picks` table, so results are scored on exactly what went
+out. Change the blocks, opening time, number of players or lines in
+`config.py` (`POST_BLOCKS`, `BLOCK_OPENS_*`, `TELEGRAM_TOP_N`,
+`TELEGRAM_LINES`, `VALUE_MARGIN`).
+
+## Running it automatically (Windows Task Scheduler)
+
+The task runs `run_daily.py --auto` **every 2 hours**. Most runs see
+nothing due and exit in a second without writing to the log. When a block
+or results post is due, the run fetches new results, retrains, predicts
+and posts. A run missed because the PC had no power or internet is caught
+up by the next one.
+
+```powershell
+$action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument '/c cd /d C:\Users\user\Documents\GitHub\football-shots-model && python scripts\run_daily.py --auto >> logs\daily.log 2>&1'
+$trigger = New-ScheduledTaskTrigger -Daily -At "00:00"
+$trigger.Repetition = (New-ScheduledTaskTrigger -Once -At "00:00" -RepetitionInterval (New-TimeSpan -Hours 2) -RepetitionDuration (New-TimeSpan -Days 1)).Repetition
+$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
+Register-ScheduledTask -TaskName "Football shots daily" -Action $action -Trigger $trigger -Settings $settings
 ```
 
-The PC has to be on and online. If it was off at 09:00, the task runs as
-soon as it can (enable "Run task as soon as possible after a scheduled
-start is missed" in the task's Settings tab). Output goes to
-`logs/daily.log`.
+Output goes to `logs/daily.log`.
 
 ## The app
 
@@ -222,9 +248,9 @@ data/published/            small files the deployed app reads (committed)
   `no_stats`/`failed`, or the run stops with a 403. Nothing already stored
   is lost.
 - **The predicted XI is wrong.** The Track record tab shows how often
-  predicted starters actually played. Posts within an hour of kickoff use
-  the confirmed XI, but each fixture is posted only once, at the first
-  daily run inside the 36-hour window.
+  predicted starters actually played. Block posts go out a day or more
+  before kickoff, so they use FotMob's predicted XI. A player who doesn't
+  play shows as ➖ (void) in the results post.
 - **Thin history.** New signings from outside these 8 competitions, and
   promoted teams, start from position averages. Predictions show
   "recent games" and a ⚠️ in Telegram.

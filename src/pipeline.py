@@ -280,45 +280,146 @@ def publish_files(preds: pd.DataFrame) -> list:
     return out
 
 
-def post_to_telegram(preds: pd.DataFrame, min_percentage: float = None, within_hours: int = 24,
-                     top_n: int = None, dry_run: bool = False, log=print) -> dict:
+# ---------------------------------------------------------------------------
+# Telegram: block posts + results
+# ---------------------------------------------------------------------------
+
+def local_now() -> datetime:
+    return datetime.now(timezone.utc).astimezone(telegram.LOCAL_TZ)
+
+
+def block_containing(day) -> dict:
+    """The posting block (config.POST_BLOCKS) a local calendar day belongs to."""
+    for name, weekdays in config.POST_BLOCKS:
+        if day.weekday() in weekdays:
+            start = day - timedelta(days=weekdays.index(day.weekday()))
+            end = start + timedelta(days=len(weekdays) - 1)
+            tz = telegram.LOCAL_TZ
+            return {
+                "key": f"{start:%Y-%m-%d} {name}",
+                "start": start, "end": end,
+                "opens": datetime(start.year, start.month, start.day, config.BLOCK_OPENS_HOUR, tzinfo=tz)
+                         - timedelta(days=config.BLOCK_OPENS_DAYS_BEFORE),
+                "closes": datetime(end.year, end.month, end.day, tzinfo=tz) + timedelta(days=1),
+                "title": f"Shots picks — {start:%a %d %b}" + (f" to {end:%a %d %b}" if end != start else ""),
+            }
+    raise ValueError(f"{day} isn't in any POST_BLOCKS entry")
+
+
+def due_blocks(now: datetime = None, preview: bool = False) -> list:
     """
-    One daily digest: the top_n most confident players across fixtures
-    kicking off within `within_hours`. Posts at most once per day, and a
-    fixture already covered by an earlier digest is never included again.
-    dry_run prints instead.
+    Blocks to post now: open, not over, not posted yet. The current block is
+    included too, so a run after the PC was off still posts what's left of it.
+    preview=True returns the current and next block regardless.
     """
-    min_percentage = config.TELEGRAM_MIN_PROB if min_percentage is None else min_percentage
-    top_n = config.TELEGRAM_TOP_N if top_n is None else top_n
-    if preds is None or preds.empty:
-        return {"posted": 0, "reason": "no predictions"}
-    token, chat_id = telegram.credentials()
-    if not dry_run and not (token and chat_id):
-        return {"posted": 0, "reason": "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set (see src/telegram.py)"}
+    now = now or local_now()
+    cur = block_containing(now.date())
+    nxt = block_containing(cur["end"] + timedelta(days=1))
+    posted = db.posted_match_ids(kind="block")
+    out = []
+    for b in (cur, nxt):
+        if now >= b["closes"]:
+            continue
+        if preview or (now >= b["opens"] and b["key"] not in posted):
+            out.append(b)
+    return out
 
-    now = datetime.now(timezone.utc)
-    day_key = f"day:{now:%Y-%m-%d}"
-    posted = db.posted_match_ids(kind="digest")
-    if day_key in posted and not dry_run:
-        return {"posted": 0, "reason": "today's digest was already posted"}
 
-    kickoff = pd.to_datetime(preds["kickoff_utc"], utc=True, format="ISO8601")
-    window = preds[(kickoff > now) & (kickoff <= now + timedelta(hours=within_hours))]
-    window = window[~window.match_id.isin(posted)]
-    title = f"Shots picks — {now:%a %d %b}"
-    messages = telegram.build_digest(window, min_percentage, top_n, title)
+def settle_picks(picks: pd.DataFrame) -> pd.DataFrame:
+    """Posted picks joined to what happened; `settled` once the match's stats are stored."""
+    if picks.empty:
+        return picks.assign(settled=False)
+    done = db.load_matches(status="completed")
+    done = set(done.loc[done.details_status == "ok", "match_id"])
+    stats = db.load_player_match_stats()[["match_id", "player_id", "minutes", "shots", "shots_on_target"]]
+    out = picks.merge(stats, on=["match_id", "player_id"], how="left")
+    out["settled"] = out.match_id.isin(done)
+    out["played"] = out["minutes"].fillna(0) > 0
+    is_sot = out.line.str.startswith("sot")
+    out["actual"] = out.shots_on_target.where(is_sot, out.shots).fillna(0)
+    out["hit"] = out.actual >= out.line.str.split(">=").str[1].astype(int)
+    return out
 
-    sent = 0
-    for text, _ in messages:
+
+def due_results(now: datetime = None) -> list:
+    """Posted blocks whose games have all finished (+3h) and whose results aren't posted yet."""
+    now = now or local_now()
+    picks = db.load_telegram_picks()
+    if picks.empty:
+        return []
+    reported = db.posted_match_ids(kind="results")
+    out = []
+    for key, g in picks.groupby("block_key"):
+        last = pd.to_datetime(g.kickoff_utc, utc=True, format="ISO8601").max()
+        if key not in reported and now > last + timedelta(hours=3):
+            out.append(key)
+    return sorted(out)
+
+
+def _send(messages: list, token, chat_id, dry_run: bool, log) -> list:
+    ids = []
+    for text in messages:
         if dry_run:
             log("----- (dry run) -----\n" + text)
-            continue
-        msg_id = telegram.send_message(text, token, chat_id)
-        sent += 1
-    if sent:
-        for mid in window.match_id.unique():
-            lt = window.loc[window.match_id == mid, "lineup_type"].iloc[0]
-            db.record_telegram_post(mid, lt, [], kind="digest")
-        db.record_telegram_post(day_key, None, [], kind="digest")
-    return {"posted": sent, "messages": len(messages), "dry_run": dry_run,
-            "fixtures": int(window.match_id.nunique())}
+        else:
+            ids.append(telegram.send_message(text, token, chat_id))
+    return ids
+
+
+def _credentials_or_reason(dry_run: bool):
+    token, chat_id = telegram.credentials()
+    if not dry_run and not (token and chat_id):
+        return None, None, "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set (see src/telegram.py)"
+    return token, chat_id, None
+
+
+def post_block(preds: pd.DataFrame, block: dict, dry_run: bool = False, log=print) -> dict:
+    """
+    Post a block's picks (fixtures in the block that haven't kicked off).
+    A block with no games or no qualifying picks is still marked done, so it
+    isn't retried every run.
+    """
+    token, chat_id, reason = _credentials_or_reason(dry_run)
+    if reason:
+        return {"block": block["key"], "posted": 0, "reason": reason}
+    now = datetime.now(timezone.utc)
+    games = pd.DataFrame()
+    if preds is not None and not preds.empty:
+        ko = telegram.local_time(preds["kickoff_utc"])
+        games = preds[(ko.dt.date >= block["start"]) & (ko.dt.date <= block["end"])
+                      & (ko > now.astimezone(telegram.LOCAL_TZ))]
+    picks = telegram.select_block_picks(games) if not games.empty else pd.DataFrame()
+    messages = (telegram.build_block_post(picks, block["title"], games.match_id.nunique())
+                if not picks.empty else [])
+    ids = _send(messages, token, chat_id, dry_run, log)
+    if not dry_run:
+        if not picks.empty:
+            db.save_telegram_picks(picks.assign(block_key=block["key"], posted_at=_now()))
+        db.record_telegram_post(block["key"], None, ids, kind="block")
+    return {"block": block["key"], "games": int(games.match_id.nunique()) if not games.empty else 0,
+            "picks": len(picks), "messages": len(messages), "dry_run": dry_run}
+
+
+def post_results(block_key: str, dry_run: bool = False, force: bool = False, log=print) -> dict:
+    """
+    Post how a block's picks did, once every pick's match is settled (or two
+    days after its last kickoff, e.g. a postponement - unsettled picks are
+    then left out).
+    """
+    token, chat_id, reason = _credentials_or_reason(dry_run)
+    if reason:
+        return {"block": block_key, "posted": 0, "reason": reason}
+    picks = settle_picks(db.load_telegram_picks(block_key))
+    last = pd.to_datetime(picks.kickoff_utc, utc=True, format="ISO8601").max()
+    if not picks.settled.all() and datetime.now(timezone.utc) < last + timedelta(days=2) and not force:
+        return {"block": block_key, "posted": 0, "reason": "waiting for match stats"}
+    season = settle_picks(db.load_telegram_picks())
+    season = season[season.settled]
+    start, name = block_key.split(" ", 1)
+    title = f"Results — {name} from {pd.Timestamp(start):%a %d %b}"
+    messages = telegram.build_results_post(picks[picks.settled], title, season)
+    ids = _send(messages, token, chat_id, dry_run, log)
+    if not dry_run:
+        db.record_telegram_post(block_key, None, ids, kind="results")
+    return {"block": block_key, "settled": int(picks.settled.sum()), "messages": len(messages),
+            "dry_run": dry_run}
