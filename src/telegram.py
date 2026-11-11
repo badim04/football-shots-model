@@ -16,6 +16,7 @@ written to the database, logs, or committed files.
 import html
 import json
 import os
+import re
 from datetime import timedelta, timezone
 
 import pandas as pd
@@ -74,21 +75,34 @@ def local_time(kickoff_utc):
     return t.dt.tz_convert(LOCAL_TZ) if isinstance(t, pd.Series) else t.tz_convert(LOCAL_TZ)
 
 
-def _split(lines: list, cont_header: str) -> list:
-    """Join lines into messages under Telegram's length limit."""
+def _split(chunks: list, cont_header: str) -> list:
+    """
+    Join chunks into messages under Telegram's length limit. A chunk (e.g.
+    one day's collapsible list) is never cut in half, so tags stay balanced.
+    """
+    def visible(s):   # Telegram's limit counts the text after tags are parsed
+        return len(html.unescape(re.sub(r"<[^>]+>", "", s)))
+
     messages, current = [], []
-    for line in lines:
-        if current and sum(len(x) + 1 for x in current) + len(line) > MAX_MESSAGE_CHARS:
+    for chunk in chunks:
+        if current and sum(visible(x) + 1 for x in current) + visible(chunk) > MAX_MESSAGE_CHARS:
             messages.append("\n".join(current))
             current = [cont_header]
-        current.append(line)
+        current.append(chunk)
     if current:
         messages.append("\n".join(current))
     return messages
 
 
-SHORT_LABELS = {"shots>=1": "1+", "shots>=2": "2+", "shots>=3": "3+", "shots>=4": "4+",
-                "sot>=1": "1+ SOT", "sot>=2": "2+ SOT"}
+def _collapsed(lines: list) -> str:
+    """A tap-to-expand quote block: the post stays short until it's opened."""
+    return "<blockquote expandable>" + "\n".join(lines) + "</blockquote>"
+
+
+# Fixed-width labels so the probability/odds columns line up in <code>
+SHORT_LABELS = {"shots>=1": "1+ ", "shots>=2": "2+ ", "shots>=3": "3+ ", "shots>=4": "4+ ",
+                "sot>=1": "SOT", "sot>=2": "2SOT"}
+RESULT_ORDER_NOTE = "ticks = 2+ · 3+ · 4+ shots · 1+ SOT"
 
 
 def select_block_picks(preds: pd.DataFrame, top_n: int = None, lines: list = None) -> pd.DataFrame:
@@ -107,54 +121,107 @@ def select_block_picks(preds: pd.DataFrame, top_n: int = None, lines: list = Non
 
 
 def _players(picks: pd.DataFrame):
-    """(first row, that player's lines) per player, in rank order."""
+    """(first row, that player's lines) per player, in the order given."""
     order = picks.drop_duplicates(["match_id", "player_id"])
     for r in order.itertuples():
         yield r, picks[(picks.match_id == r.match_id) & (picks.player_id == r.player_id)]
 
 
+def _cell(p) -> str:
+    return f"{SHORT_LABELS.get(p.line, p.line)} {p.prob:>4.0%} @{1 / p.prob:<4.2f}"
+
+
+def _block_dates(picks: pd.DataFrame) -> str:
+    days = sorted(local_time(picks.kickoff_utc).dt.date.unique())
+    first, last = days[0], days[-1]
+    return f"{first:%a %d %b}" + (f" – {last:%a %d %b}" if last != first else "")
+
+
 def build_block_post(picks: pd.DataFrame, title: str, n_games: int) -> list:
-    """The block's top players, each with every line's probability and fair odds."""
+    """
+    At a glance: the block, then the 5 best 3+ shots lines. Tap a day to
+    see every player in it, grouped by game, with each line's probability
+    and fair odds.
+    """
     if picks.empty:
         return []
-    lines = [f"⚽ <b>{html.escape(title)}</b>",
-             f"<i>Top {picks.player_id.nunique()} players by expected shots · {n_games} games · "
-             f"kickoff {config.LOCAL_TZ_LABEL} · % = model probability, @ = fair odds</i>"]
-    for i, (r, own) in enumerate(_players(picks), 1):
-        ko = local_time(r.kickoff_utc).strftime("%a %H:%M")
-        notes = (" ⚠️" if getattr(r, "sample_size_overall", 7) < config.MIN_SAMPLE_SIZE_WARNING else "") + \
-                (" (XI est.)" if getattr(r, "lineup_type", None) == "estimated" else "")
-        odds = " · ".join(f"{SHORT_LABELS.get(p.line, p.line)} {p.prob:.0%} @{1 / p.prob:.2f}"
-                          for p in own.itertuples())
-        lines += ["", f"{i}. <b>{html.escape(r.player_name)}</b> ({html.escape(r.team)} v "
-                      f"{html.escape(r.opponent)}, {ko}) <i>xShots {r.pred_shots:.1f}</i>{notes}",
-                  f"    {odds}"]
-    lines += ["", f"💡 Bet a line only when the bookmaker pays at least {config.VALUE_MARGIN:.2f}× "
-                  f"the fair odds (e.g. @2.00 → need 2.20+). Below that, skip it however likely it looks.",
-              f"<i>{html.escape(config.TELEGRAM_FOOTER, quote=False)}</i>"]
-    return _split(lines, f"⚽ <b>{html.escape(title)}</b> (cont.)")
+    picks = picks.assign(ko=local_time(picks.kickoff_utc))
+    head = [f"⚽ <b>SHOTS PICKS · {_block_dates(picks)}</b>",
+            f"<i>{n_games} games · top {picks.player_id.nunique()} shooters · times {config.LOCAL_TZ_LABEL}</i>"]
+
+    star_line = "shots>=3" if "shots>=3" in set(picks.line) else picks.line.iloc[0]
+    star = picks[picks.line == star_line].sort_values("prob", ascending=False).head(5)
+    head += ["", f"⭐ <b>Best {LINE_LABELS.get(star_line, star_line)}</b>"]
+    for r in star.itertuples():
+        head.append(f"<code>{r.prob:>4.0%} @{1 / r.prob:.2f}</code>  <b>{html.escape(r.player_name)}</b> "
+                    f"· {r.ko:%a %H:%M}")
+
+    chunks = ["\n".join(head)]
+    by_day = picks.sort_values(["ko", "match_id", "rank"])
+    for day, d in by_day.groupby(by_day.ko.dt.date, sort=True):
+        body = []
+        for _, g in d.groupby(["ko", "match_id"], sort=True):
+            first = g.iloc[0]
+            label = first.get("match_label") or f"{first.team} v {first.opponent}"
+            body += ["", f"🕒 <b>{first.ko:%H:%M}  {html.escape(label)}</b>"]
+            for r, own in _players(g):
+                cells = [_cell(p) for p in own.itertuples()]
+                rows = [" │ ".join(cells[i:i + 2]) for i in range(0, len(cells), 2)]
+                notes = (" ⚠️" if getattr(r, "sample_size_overall", 7) < config.MIN_SAMPLE_SIZE_WARNING else "") + \
+                        (" · XI est." if getattr(r, "lineup_type", None) == "estimated" else "")
+                body.append(f"👤 <b>{html.escape(r.player_name)}</b> ({html.escape(r.team)}) "
+                            f"· xShots {r.pred_shots:.1f}{notes}")
+                body += [f"<code>{row}</code>" for row in rows]
+        n = d.player_id.nunique()
+        chunks.append(f"\n📅 <b>{day:%A %d %b}</b> — {n} player{'s' * (n != 1)} · tap to open\n"
+                      + _collapsed(body[1:]))
+
+    chunks.append("\n" + _collapsed([
+        "<b>How to read it</b>",
+        "% = model probability · @ = fair odds (1 ÷ probability).",
+        f"Bet a line only if the bookmaker pays at least {config.VALUE_MARGIN:.2f}× the fair odds "
+        "(fair @2.00 → need 2.20+). Lower than that, skip it however likely it looks.",
+        "⚠️ = little recent history · XI est. = no FotMob lineup yet.",
+        f"<i>{html.escape(config.TELEGRAM_FOOTER, quote=False)}</i>"]))
+    return _split(chunks, f"⚽ <b>SHOTS PICKS · {_block_dates(picks)}</b> (cont.)")
+
+
+def _scoreboard(df: pd.DataFrame) -> list:
+    """One aligned row per line: hits/picks, hit rate, model expectation."""
+    rows = []
+    for line, g in df[df.played].groupby("line", sort=False):
+        verdict = "🟢" if g.hit.mean() >= g.prob.mean() - 0.02 else ("🟡" if g.hit.mean() >= g.prob.mean() - 0.10 else "🔴")
+        rows.append(f"{verdict} <code>{LINE_LABELS.get(line, line):<9}{int(g.hit.sum()):>2}/{len(g):<3}"
+                    f"{g.hit.mean():>4.0%}  exp {g.prob.mean():>3.0%}</code>")
+    return rows
 
 
 def build_results_post(settled: pd.DataFrame, title: str, season: pd.DataFrame) -> list:
     """
-    How a block's posted players did: each player's shots/SOT with ✅/❌ per
-    line (➖ = didn't play, void), hits vs expected per line, and the
-    running total over every block posted so far.
+    At a glance: per-line scoreboard (🟢 at or above what the model
+    expected, 🟡 a bit below, 🔴 well below) and the block's best shooter.
+    Tap to see every player and the running totals.
     """
-    lines = [f"📊 <b>{html.escape(title)}</b>", ""]
-    for r, own in _players(settled):
-        if not r.played:
-            lines.append(f"➖ {html.escape(r.player_name)} — didn't play")
-            continue
-        marks = " ".join(f"{SHORT_LABELS.get(p.line, p.line)} {'✅' if p.hit else '❌'}" for p in own.itertuples())
-        lines.append(f"{html.escape(r.player_name)}: {int(r.shots)} shots, {int(r.shots_on_target)} SOT — {marks}")
+    if settled.empty:
+        return []
+    head = [f"📊 <b>RESULTS · {_block_dates(settled)}</b>", ""] + _scoreboard(settled)
+    live = settled[settled.played].drop_duplicates(["match_id", "player_id"])
+    if not live.empty:
+        best = live.sort_values("shots", ascending=False).iloc[0]
+        head += ["", f"🏆 Top shooter: <b>{html.escape(best.player_name)}</b> — "
+                     f"{int(best.shots)} shots, {int(best.shots_on_target)} on target"]
 
-    def summary(df):
-        live = df[df.played]
-        return [f"• {LINE_LABELS.get(line, line)}: {int(g.hit.sum())}/{len(g)} hit ({g.hit.mean():.0%}), "
-                f"model expected {g.prob.mean():.0%}" for line, g in live.groupby("line", sort=False)]
-    lines += ["", "<b>This block</b>"] + summary(settled)
+    body = [f"<i>{RESULT_ORDER_NOTE}</i>"]
+    ordered = settled.assign(_s=settled.shots.fillna(-1)).sort_values("_s", ascending=False, kind="stable")
+    for r, own in _players(ordered):
+        if not r.played:
+            body.append(f"➖➖➖➖ {html.escape(r.player_name)} — didn't play (void)")
+            continue
+        marks = "".join("✅" if p.hit else "❌" for p in own.itertuples())
+        body.append(f"{marks} <b>{html.escape(r.player_name)}</b> — {int(r.shots)} sh · {int(r.shots_on_target)} SOT")
+    chunks = ["\n".join(head), "\n👥 <b>Every player</b> · tap to open\n" + _collapsed(body)]
     if season.block_key.nunique() > 1:
-        lines += ["", f"<b>All {season.block_key.nunique()} blocks so far</b>"] + summary(season)
-    lines += ["", "<i>Hit rate close to the expected % = the probabilities can be trusted.</i>"]
-    return _split(lines, f"📊 <b>{html.escape(title)}</b> (cont.)")
+        chunks.append(f"\n📈 <b>All {season.block_key.nunique()} blocks so far</b> · tap to open\n"
+                      + _collapsed(_scoreboard(season)))
+    chunks.append("\n<i>🟢 hit rate at or above the model's % · 🟡 a little below · 🔴 well below</i>")
+    return _split(chunks, f"📊 <b>RESULTS · {_block_dates(settled)}</b> (cont.)")

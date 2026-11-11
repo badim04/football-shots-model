@@ -156,6 +156,42 @@ Register-ScheduledTask -TaskName "Football shots daily" -Action $action -Trigger
 
 Output goes to `logs/daily.log`.
 
+## Running it on the server instead (and switching back)
+
+The same job can run on the Vultr server (1 GB, shared with PROWL, Hood
+Watch and VersusX). It runs as a **systemd timer**, like everything else
+on that box, rather than in Docker, which would cost memory the server
+doesn't have. The service runs at low priority with a memory ceiling, so
+it slows down rather than squeezing PROWL's agents.
+
+**Only one place runs it at a time.** Each script turns the other side
+off, so nothing gets posted twice. From PowerShell, in the project folder:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\switch_to_server.ps1   # PC -> server
+powershell -ExecutionPolicy Bypass -File scripts\switch_to_pc.ps1       # server -> PC
+```
+
+- **To the server:** turns off the PC task, then copies the committed
+  code, `.env`, the database and the model to `/opt/football-shots`, and
+  starts the timer. Running it again while the server is active only
+  updates the code. Do that after committing a change.
+- **Back to the PC:** stops the server's timer and copies its database and
+  model back. The PC's old copy is kept as `data/matches.db.bak-<date>`.
+  Then the PC task is turned back on. If the server is already gone, the
+  PC carries on from its own copy. Missed results are fetched again, but
+  posts the server made since the switch aren't known, so the current
+  block may be posted twice.
+
+On the server:
+
+| What | Command (prefix with `ssh root@199.247.2.139`) |
+|---|---|
+| Next runs | `systemctl list-timers football-shots.timer` |
+| Log | `journalctl -u football-shots -n 80` |
+| Run now | `systemctl start football-shots` |
+| Preview posts | `cd /opt/football-shots && sudo -u shots .venv/bin/python scripts/run_daily.py --telegram --dry-run --skip-update` |
+
 ## The app
 
 ```bash

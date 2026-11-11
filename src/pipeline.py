@@ -388,6 +388,10 @@ def post_block(preds: pd.DataFrame, block: dict, dry_run: bool = False, log=prin
         ko = telegram.local_time(preds["kickoff_utc"])
         games = preds[(ko.dt.date >= block["start"]) & (ko.dt.date <= block["end"])
                       & (ko > now.astimezone(telegram.LOCAL_TZ))]
+    if not games.empty:
+        m = db.load_matches(seasons=[config.CURRENT_SEASON])
+        labels = dict(zip(m.match_id, m.home_team + " v " + m.away_team))
+        games = games.assign(match_label=games.match_id.map(labels))
     picks = telegram.select_block_picks(games) if not games.empty else pd.DataFrame()
     messages = (telegram.build_block_post(picks, block["title"], games.match_id.nunique())
                 if not picks.empty else [])

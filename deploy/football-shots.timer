@@ -1,0 +1,12 @@
+# Every 2 hours. Most runs see nothing due and exit at once; the script
+# decides what to post (Lagos time, see POST_BLOCKS in config.py).
+[Unit]
+Description=Football shots model every 2 hours
+
+[Timer]
+OnCalendar=*-*-* 00/2:15:00
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

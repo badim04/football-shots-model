@@ -5,6 +5,7 @@ data/raw_cache/
 # data/published/ instead. Models are rebuilt by every retrain.
 data/matches.db
 data/matches.db-journal
+data/matches.db.bak-*
 models/*.joblib
 
 # Daily job output

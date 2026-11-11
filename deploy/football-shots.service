@@ -1,0 +1,26 @@
+# One scheduled run of the shots model (started by football-shots.timer).
+# It shares a 1 GB server with PROWL's trading agents, so it is the one that
+# gives way: low CPU/IO priority, pushed to swap past MemoryHigh, and first
+# in line for the OOM killer.
+[Unit]
+Description=Football shots model - scheduled run
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=shots
+WorkingDirectory=/opt/football-shots
+ExecStart=/opt/football-shots/.venv/bin/python -u scripts/run_daily.py --auto
+Environment=PYTHONIOENCODING=utf-8
+Environment=OMP_NUM_THREADS=1
+Nice=15
+CPUWeight=20
+IOWeight=20
+MemoryHigh=350M
+MemoryMax=1200M
+OOMScoreAdjust=900
+TimeoutStartSec=3h
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true

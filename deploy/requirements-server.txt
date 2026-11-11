@@ -1,0 +1,8 @@
+# What the scheduled job needs - the Streamlit app isn't run on the server.
+pandas>=2.0
+numpy>=1.24
+requests>=2.31
+scikit-learn>=1.4
+xgboost>=2.0
+joblib>=1.3
+scipy>=1.11
